@@ -3,7 +3,12 @@ import type { TriggerConfigInput } from "./automation-triggers";
 import { BRAND } from "./brand";
 import { OWN_ROOT_DOMAINS } from "./own-domains";
 
-export { CANONICAL_URLS, IOS_APP } from "./app-identity";
+export { ANDROID_APP, CANONICAL_URLS, IOS_APP } from "./app-identity";
+
+// SHA-256 of the certificates that sign the Android app: the EAS upload key and
+// the Play App Signing key. Not in app-identity.ts, so adding one leaves the
+// mobile runtime version alone.
+export const ANDROID_SIGNING_CERT_SHA256: readonly string[] = [];
 
 // Auth
 export const AUTH_PROVIDERS = ["github", "google"] as const;

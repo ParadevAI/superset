@@ -10,6 +10,10 @@ export const IOS_APP = {
 	APP_ID: `${IOS_TEAM_ID}.${IOS_BUNDLE_ID}`,
 } as const;
 
+export const ANDROID_APP = {
+	PACKAGE: "sh.superset.mobile",
+} as const;
+
 // Mobile bundles inline only EXPO_PUBLIC_*. The desktop renderer has no
 // process global; its build defines NEXT_PUBLIC_ROOT_DOMAIN non-empty, so the
 // second read never runs there.

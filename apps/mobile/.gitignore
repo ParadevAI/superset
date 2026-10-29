@@ -44,6 +44,8 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+# Gradle output of a local module's android/ library
+modules/*/android/build/
 
 # storybook (generated on start)
 .rnstorybook/storybook.requires.ts

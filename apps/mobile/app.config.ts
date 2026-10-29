@@ -1,6 +1,6 @@
 import path from "node:path";
 import { SUPPORTED_LOCALES } from "@superset/i18n/locales";
-import { IOS_APP } from "@superset/shared/app-identity";
+import { ANDROID_APP, IOS_APP } from "@superset/shared/app-identity";
 import { BRAND } from "@superset/shared/brand";
 import { config } from "dotenv";
 import type { ConfigContext } from "expo/config";
@@ -21,8 +21,21 @@ if (process.env.MOBILE_EAS_BUILD !== "1") {
 const webUrl = new URL(
 	process.env.EXPO_PUBLIC_WEB_URL || "https://app.superset.sh",
 );
-const associatedDomains =
-	webUrl.protocol === "https:" ? [`applinks:${webUrl.hostname}`] : undefined;
+const appLinksHost = webUrl.protocol === "https:" ? webUrl.hostname : undefined;
+const associatedDomains = appLinksHost && [`applinks:${appLinksHost}`];
+// Same paths as apple-app-site-association in apps/web.
+const appLinkIntentFilters = appLinksHost && [
+	{
+		action: "VIEW",
+		autoVerify: true,
+		data: ["/page/", "/workspaces/"].map((pathPrefix) => ({
+			scheme: "https",
+			host: appLinksHost,
+			pathPrefix,
+		})),
+		category: ["BROWSABLE", "DEFAULT"],
+	},
+];
 
 const webBaseUrl = process.env.MOBILE_WEB_BASE_URL;
 
@@ -92,10 +105,11 @@ export default ({ config }: ConfigContext) => ({
 	android: {
 		adaptiveIcon: {
 			foregroundImage: "./assets/adaptive-icon.png",
-			backgroundColor: "#ffffff",
+			backgroundColor: "#151110",
 		},
-		package: "sh.superset.mobile",
+		package: ANDROID_APP.PACKAGE,
 		predictiveBackGestureEnabled: false,
+		...(appLinkIntentFilters && { intentFilters: appLinkIntentFilters }),
 	},
 	web: {
 		favicon: "./assets/favicon.png",
@@ -141,7 +155,12 @@ export default ({ config }: ConfigContext) => ({
 		],
 		[
 			"expo-localization",
-			{ supportedLocales: { ios: [...SUPPORTED_LOCALES] } },
+			{
+				supportedLocales: {
+					ios: [...SUPPORTED_LOCALES],
+					android: [...SUPPORTED_LOCALES],
+				},
+			},
 		],
 		"expo-apple-authentication",
 		[
