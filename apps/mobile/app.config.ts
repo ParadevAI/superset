@@ -4,6 +4,7 @@ import { ANDROID_APP, IOS_APP } from "@superset/shared/app-identity";
 import { BRAND } from "@superset/shared/brand";
 import { config } from "dotenv";
 import type { ConfigContext } from "expo/config";
+import { withAndroidLabel } from "./config-plugins/withAndroidLabel";
 import { withIosAccentColor } from "./config-plugins/withIosAccentColor";
 import { withSceneLifecycle } from "./config-plugins/withSceneLifecycle";
 
@@ -124,6 +125,7 @@ export default ({ config }: ConfigContext) => ({
 		[withIosAccentColor, { color: "#262626" }],
 		// iOS 27 SDK: an app without the UIScene life cycle traps on launch.
 		withSceneLifecycle,
+		[withAndroidLabel, { label: BRAND.NAME }],
 		"@bacons/apple-targets",
 		"expo-router",
 		[
@@ -194,6 +196,12 @@ export default ({ config }: ConfigContext) => ({
 			"expo-build-properties",
 			{
 				ios: { deploymentTarget: "26.0", buildReactNativeFromSource: true },
+				// WorkManager keeps its input mergers without members, so R8 full
+				// mode strips the constructor it reflects on and every job fails.
+				android: {
+					extraProguardRules:
+						"-keep class * extends androidx.work.InputMerger { public <init>(); }",
+				},
 			},
 		],
 		// SDK 57 no longer autolinks config plugins; every installed plugin has

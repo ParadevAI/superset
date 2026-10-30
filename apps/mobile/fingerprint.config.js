@@ -2,14 +2,25 @@
 // out of the fingerprint lets a build that differs only in its name take the
 // same updates as the builds already installed.
 const BRAND_SOURCE = "../../packages/shared/src/brand.ts";
+const ANDROID_LABEL_PLUGIN = "withAndroidLabel";
 
 /** @param {string} expoConfigJson */
 function withoutDisplayName(expoConfigJson) {
 	const expoConfig = JSON.parse(expoConfigJson);
-	if (expoConfig.ios?.infoPlist?.CFBundleDisplayName === undefined) {
+	const hasIosName =
+		expoConfig.ios?.infoPlist?.CFBundleDisplayName !== undefined;
+	const androidLabel = expoConfig.plugins?.findIndex(
+		(plugin) => Array.isArray(plugin) && plugin[0] === ANDROID_LABEL_PLUGIN,
+	);
+	if (!hasIosName && !(androidLabel >= 0)) {
 		return expoConfigJson;
 	}
-	delete expoConfig.ios.infoPlist.CFBundleDisplayName;
+	if (hasIosName) {
+		delete expoConfig.ios.infoPlist.CFBundleDisplayName;
+	}
+	if (androidLabel >= 0) {
+		expoConfig.plugins[androidLabel] = ANDROID_LABEL_PLUGIN;
+	}
 	return JSON.stringify(expoConfig);
 }
 

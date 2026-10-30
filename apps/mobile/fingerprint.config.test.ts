@@ -7,7 +7,7 @@ const hook = (
 	chunk: string,
 ) => fingerprintConfig.fileHookTransform(source, chunk, true, "utf8");
 
-describe("the runtime fingerprint ignores the iOS display name", () => {
+describe("the runtime fingerprint ignores the home-screen name", () => {
 	const withoutName = JSON.stringify({
 		ios: { infoPlist: { NSSupportsLiveActivities: true } },
 		name: "Superset",
@@ -28,6 +28,19 @@ describe("the runtime fingerprint ignores the iOS display name", () => {
 
 	test("an expo config without a display name is left as it is", () => {
 		expect(hook(expoConfigSource, withoutName)).toBe(withoutName);
+	});
+
+	test("the Android label hashes the same whatever it says", () => {
+		const labelled = (label: string) =>
+			JSON.stringify({
+				plugins: [["withAndroidLabel", { label }], "expo-router"],
+			});
+		expect(hook(expoConfigSource, labelled("Other Name"))).toBe(
+			hook(expoConfigSource, labelled("Paradev")),
+		);
+		expect(hook(expoConfigSource, labelled("Paradev"))).not.toContain(
+			"Paradev",
+		);
 	});
 
 	test("other sources are left as they are", () => {
