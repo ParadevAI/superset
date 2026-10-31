@@ -38,6 +38,10 @@ const RATE_LIMIT_DEFAULT_HOLD_MS = 5 * 60_000;
 const RATE_LIMIT_MAX_HOLD_MS = 65 * 60_000;
 // Land just past the reset so the first retry is not a second 403.
 const RATE_LIMIT_RESET_SLACK_MS = 5_000;
+// One exec kill is usually this host's own overload (see
+// `isGitHubTimeoutError`). Repeated kills with no answer in between are what a
+// dropped network looks like, and without the hold the queue would never drain.
+const TIMEOUTS_BEFORE_HOLD = 3;
 
 export type GitHubHoldReason = "unreachable" | "rate-limited" | "auth";
 
@@ -98,14 +102,25 @@ export function isGitHubUnreachableError(error: unknown): boolean {
 	for (let depth = 0; depth < MAX_CAUSE_DEPTH && current; depth++) {
 		const code = codeOf(current);
 		if (code && UNREACHABLE_CODES.has(code)) return true;
-		// execFile's timeout: the child was killed before it produced a result.
-		// For `gh` that is a hung network call; a fast failure exits on its own.
+		if (UNREACHABLE_STDERR.test(textOf(current))) return true;
+		current = (current as { cause?: unknown }).cause;
+	}
+	return false;
+}
+
+/**
+ * A kill by our own exec limits: the 10s deadline, or the stdout cap in
+ * `exec-gh.ts`. The child never answered, which says nothing about GitHub on
+ * its own: on a busy host the process was starved, not the network.
+ */
+export function isGitHubTimeoutError(error: unknown): boolean {
+	let current: unknown = error;
+	for (let depth = 0; depth < MAX_CAUSE_DEPTH && current; depth++) {
 		const { killed, signal } = current as {
 			killed?: unknown;
 			signal?: unknown;
 		};
 		if (killed === true && typeof signal === "string") return true;
-		if (UNREACHABLE_STDERR.test(textOf(current))) return true;
 		current = (current as { cause?: unknown }).cause;
 	}
 	return false;
@@ -190,6 +205,7 @@ export function classifyGitHubHold(error: unknown): GitHubHoldReason | null {
 
 export class GitHubAvailabilityGate {
 	private streak = 0;
+	private timeouts = 0;
 	private hold: GitHubAvailabilityStatus | null = null;
 	private readonly now: () => number;
 
@@ -227,8 +243,11 @@ export class GitHubAvailabilityGate {
 	recordFailure(
 		error: unknown,
 	): { reason: GitHubHoldReason; holdMs: number; opened: boolean } | null {
-		const reason = classifyGitHubHold(error);
-		if (!reason) return null;
+		const classified = classifyGitHubHold(error);
+		// Every answer, classified or not, breaks a run of kills.
+		const reachedTimeoutThreshold = this.countTimeout(error);
+		if (!classified && !reachedTimeoutThreshold) return null;
+		const reason = classified ?? "unreachable";
 		const now = this.now();
 		if (this.hold && this.hold.until > now) {
 			return {
@@ -260,8 +279,22 @@ export class GitHubAvailabilityGate {
 		return { reason, holdMs, opened: true };
 	}
 
+	/**
+	 * A kill by our own exec limits says nothing about GitHub on its own, so
+	 * only a run of them opens the hold.
+	 */
+	private countTimeout(error: unknown): boolean {
+		if (!isGitHubTimeoutError(error)) {
+			this.timeouts = 0;
+			return false;
+		}
+		this.timeouts += 1;
+		return this.timeouts >= TIMEOUTS_BEFORE_HOLD;
+	}
+
 	recordSuccess(): void {
 		this.streak = 0;
+		this.timeouts = 0;
 		this.hold = null;
 	}
 }

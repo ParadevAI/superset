@@ -4,5 +4,6 @@ export {
 	type GitHubAvailabilityStatus,
 	type GitHubHoldReason,
 	GitHubUnavailableError,
+	isGitHubTimeoutError,
 	isGitHubUnreachableError,
 } from "./github-availability";

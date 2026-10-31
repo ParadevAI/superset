@@ -16,10 +16,12 @@ import type { GitWatcher } from "../../events/git-watcher";
 import type { ExecGh } from "../../trpc/router/workspace-creation/utils/exec-gh";
 import { type GitFactory, resolveDefaultBranchName } from "../git";
 import { ConditionalGh } from "./utils/conditional-gh";
+import { GH_CALL_CONCURRENCY, GhCallLimiter } from "./utils/gh-concurrency";
 import {
 	GitHubAvailabilityGate,
 	type GitHubAvailabilityStatus,
 	GitHubUnavailableError,
+	isGitHubTimeoutError,
 	isGitHubUnreachableError,
 } from "./utils/github-availability";
 import {
@@ -220,6 +222,8 @@ interface PullRequestDetails {
 export class PullRequestRuntimeManager {
 	private readonly db: HostDb;
 	private readonly execGh: ExecGh;
+	private readonly probeExecGh: ExecGh;
+	private readonly ghCalls: GhCallLimiter;
 	private readonly conditionalGh: ConditionalGh;
 	private readonly git: GitFactory;
 	private readonly github: () => Promise<Octokit>;
@@ -284,8 +288,14 @@ export class PullRequestRuntimeManager {
 
 	constructor(options: PullRequestRuntimeManagerOptions) {
 		this.db = options.db;
-		this.conditionalGh = new ConditionalGh(options.execGh);
+		this.ghCalls = new GhCallLimiter(
+			options.execGh,
+			GH_CALL_CONCURRENCY,
+			(error) => this.recordGhFailure(error),
+		);
+		this.conditionalGh = new ConditionalGh(this.ghCalls.exec);
 		this.execGh = this.conditionalGh.exec;
+		this.probeExecGh = this.ghCalls.probe;
 		this.git = options.git;
 		this.github = options.github;
 		this.gitWatcher = options.gitWatcher;
@@ -1277,7 +1287,7 @@ export class PullRequestRuntimeManager {
 	private async fetchFromGitHub<T>(
 		what: string,
 		context: Record<string, unknown>,
-		viaGh: () => Promise<T>,
+		viaGh: (execGh: ExecGh) => Promise<T>,
 		viaOctokit: () => Promise<T>,
 		options: { probe?: boolean } = {},
 	): Promise<T> {
@@ -1286,12 +1296,18 @@ export class PullRequestRuntimeManager {
 		// once the network is back.
 		if (!options.probe) this.githubGate.assertReachable();
 		try {
-			const result = await viaGh();
+			// A probe keeps its queue slot through a hold, so a user refresh can
+			// reopen the gate even when its sweep was drained ahead of it.
+			const result = await viaGh(
+				options.probe ? this.probeExecGh : this.execGh,
+			);
 			this.githubGate.recordSuccess();
 			return result;
 		} catch (ghError) {
-			if (isGitHubUnreachableError(ghError)) {
-				this.noteGitHubFailure(ghError);
+			// A gated or drained call never reached gh; Octokit would bypass the
+			// gate. The gate itself saw every failure in the limiter.
+			if (ghError instanceof GitHubUnavailableError) throw ghError;
+			if (isGitHubTimeoutError(ghError) || isGitHubUnreachableError(ghError)) {
 				throw ghError;
 			}
 			console.warn(
@@ -1309,10 +1325,21 @@ export class PullRequestRuntimeManager {
 		}
 	}
 
+	/**
+	 * Runs from the limiter, before the slot moves on, so the hold opens (and
+	 * drains the queue) ahead of the next spawn.
+	 */
+	private recordGhFailure(error: unknown): void {
+		if (isGitHubTimeoutError(error) || isGitHubUnreachableError(error)) {
+			this.noteGitHubFailure(error);
+		}
+	}
+
 	/** Trips the gate on a host-wide failure and says so once per hold. */
 	private noteGitHubFailure(error: unknown): void {
 		const hold = this.githubGate.recordFailure(error);
 		if (!hold?.opened) return;
+		this.ghCalls.drain(new GitHubUnavailableError(hold.reason, hold.holdMs));
 		console.warn(
 			`[host-service:pull-request-runtime] GitHub ${hold.reason}; holding GitHub lookups for ${Math.round(hold.holdMs / 1000)}s`,
 			{ error },
@@ -1418,9 +1445,9 @@ export class PullRequestRuntimeManager {
 				this.fetchFromGitHub(
 					"PR head lookup",
 					{ owner: repo.owner, name: repo.name, head },
-					() =>
+					(execGh) =>
 						fetchPullRequestByHeadFromGh(
-							this.execGh,
+							execGh,
 							{ owner: repo.owner, name: repo.name },
 							head,
 						),
@@ -1457,15 +1484,15 @@ export class PullRequestRuntimeManager {
 				const [reviewDecision, checks] = await this.fetchFromGitHub(
 					"PR review/check lookup",
 					context,
-					() =>
+					(execGh) =>
 						Promise.all([
 							fetchPullRequestReviewDecisionFromGh(
-								this.execGh,
+								execGh,
 								repo,
 								node.number,
 								node.state,
 							),
-							fetchPullRequestChecksFromGh(this.execGh, repo, node.headRefOid),
+							fetchPullRequestChecksFromGh(execGh, repo, node.headRefOid),
 						]),
 					async () => {
 						const octokit = await this.github();
@@ -1491,9 +1518,9 @@ export class PullRequestRuntimeManager {
 						isInMergeQueue = await this.fetchFromGitHub(
 							"PR merge-queue lookup",
 							context,
-							() =>
+							(execGh) =>
 								fetchPullRequestMergeQueueStateFromGh(
-									this.execGh,
+									execGh,
 									repo,
 									node.number,
 								),
@@ -1533,8 +1560,8 @@ export class PullRequestRuntimeManager {
 				this.fetchFromGitHub(
 					"open-PR sweep",
 					{ owner: repo.owner, name: repo.name },
-					() =>
-						fetchOpenPullRequestsFromGh(this.execGh, {
+					(execGh) =>
+						fetchOpenPullRequestsFromGh(execGh, {
 							owner: repo.owner,
 							name: repo.name,
 						}),

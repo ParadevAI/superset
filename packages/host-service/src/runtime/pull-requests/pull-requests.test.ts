@@ -11,6 +11,7 @@ import * as schema from "../../db/schema";
 import { pullRequests, workspaces } from "../../db/schema";
 import type { WorkspaceChangedMessage } from "../../events/types";
 import { PullRequestRuntimeManager } from "./pull-requests";
+import { GH_CALL_CONCURRENCY } from "./utils/gh-concurrency";
 import { GitHubAvailabilityGate } from "./utils/github-availability";
 import type { WorkspaceRefsSnapshot } from "./utils/workspace-refs";
 
@@ -239,6 +240,13 @@ async function withSilencedWarnings<T>(fn: () => Promise<T>): Promise<T> {
 		console.warn = original;
 	}
 }
+
+// Lets every resume a released slot triggers run before the next assertion.
+const tick = () => {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	return promise;
+};
 
 describe("PullRequestRuntimeManager direct checkout PR linking", () => {
 	test("links a fork PR workspace to the selected PR and records fork upstream", async () => {
@@ -1006,7 +1014,9 @@ describe("PullRequestRuntimeManager refresh", () => {
 					fetchOpenPrs(repoOf(name)).catch(() => {}),
 				),
 			);
-			expect(ghAttempts).toBe(6);
+			// Six lookups pass the gate; the hold opened on the first failure
+			// drops the two still queued behind the slots.
+			expect(ghAttempts).toBe(4);
 			expect(
 				warns.filter((w) => w.includes("GitHub unreachable")),
 			).toHaveLength(1);
@@ -1014,11 +1024,240 @@ describe("PullRequestRuntimeManager refresh", () => {
 			// One outage, one streak: the hold is the base minute, not the cap.
 			setSystemTime(new Date(t0 + 61_000));
 			await fetchOpenPrs(repoOf("g")).catch(() => {});
-			expect(ghAttempts).toBe(7);
+			expect(ghAttempts).toBe(5);
 		} finally {
 			console.warn = originalWarn;
 			setSystemTime();
 		}
+	});
+
+	test("a gh timeout does not open the unreachable hold, a transport failure does", async () => {
+		const db = createRealDb();
+		seedProject(db);
+		let ghAttempts = 0;
+		let timeout = true;
+		const manager = createManager(db, {
+			execGh: async () => {
+				ghAttempts += 1;
+				throw timeout
+					? Object.assign(new Error("Command failed"), {
+							killed: true,
+							signal: "SIGTERM",
+							code: null,
+						})
+					: Object.assign(new Error("Command failed"), { code: "ENOTFOUND" });
+			},
+			github: (async () => {
+				throw new Error("octokit must not run");
+			}) as never,
+		});
+		const repoOf = (name: string) => ({
+			provider: "github" as const,
+			owner: REPO.owner,
+			name,
+			url: `https://github.com/${REPO.owner}/${name}.git`,
+			remoteName: "origin",
+			defaultBranch: "main",
+		});
+		const fetchOpenPrs = openPullRequestsSweeper(manager);
+
+		// Our own 10s deadline killed the child; GitHub never said anything.
+		await withSilencedWarnings(() =>
+			fetchOpenPrs(repoOf("repo-a")).catch(() => {}),
+		);
+		expect(ghAttempts).toBe(1);
+		expect(manager.getGithubStatus()).toBeNull();
+
+		// The resolver fails on the next repo: that is GitHub being unreachable.
+		timeout = false;
+		await withSilencedWarnings(() =>
+			fetchOpenPrs(repoOf("repo-b")).catch(() => {}),
+		);
+		expect(ghAttempts).toBe(2);
+		expect(manager.getGithubStatus()?.reason).toBe("unreachable");
+	});
+
+	test("a sweep over many repos keeps gh spawns at the concurrency limit", async () => {
+		const db = createRealDb();
+		seedProject(db);
+		let calls = 0;
+		let inFlight = 0;
+		let peak = 0;
+		const releases: Array<() => void> = [];
+		const manager = createManager(db, {
+			execGh: async () => {
+				calls += 1;
+				inFlight += 1;
+				peak = Math.max(peak, inFlight);
+				const answer = Promise.withResolvers<unknown>();
+				releases.push(() => {
+					inFlight -= 1;
+					answer.resolve([]);
+				});
+				return answer.promise;
+			},
+		});
+		const repoOf = (name: string) => ({
+			provider: "github" as const,
+			owner: REPO.owner,
+			name,
+			url: `https://github.com/${REPO.owner}/${name}.git`,
+			remoteName: "origin",
+			defaultBranch: "main",
+		});
+		const fetchOpenPrs = openPullRequestsSweeper(manager);
+
+		await withSilencedWarnings(async () => {
+			const sweeps = Array.from({ length: 10 }, (_, index) =>
+				fetchOpenPrs(repoOf(`repo-${index}`)),
+			);
+			await tick();
+			expect(peak).toBe(GH_CALL_CONCURRENCY);
+
+			while (releases.length > 0) {
+				releases.shift()?.();
+				await tick();
+			}
+			await Promise.all(sweeps);
+		});
+
+		expect(calls).toBe(10);
+		expect(peak).toBe(GH_CALL_CONCURRENCY);
+	});
+
+	test("the hold drops lookups the sweep already queued", async () => {
+		const db = createRealDb();
+		seedProject(db);
+		let ghAttempts = 0;
+		const releases: Array<() => void> = [];
+		const rejects: Array<(error: Error) => void> = [];
+		const manager = createManager(db, {
+			execGh: () => {
+				ghAttempts += 1;
+				const answer = Promise.withResolvers<unknown>();
+				if (ghAttempts <= GH_CALL_CONCURRENCY) {
+					releases.push(() => answer.resolve([]));
+					rejects.push((error) => answer.reject(error));
+				} else {
+					answer.resolve([]);
+				}
+				return answer.promise;
+			},
+			github: (async () => {
+				throw new Error("octokit must not run");
+			}) as never,
+		});
+		const repoOf = (name: string) => ({
+			provider: "github" as const,
+			owner: REPO.owner,
+			name,
+			url: `https://github.com/${REPO.owner}/${name}.git`,
+			remoteName: "origin",
+			defaultBranch: "main",
+		});
+		const fetchOpenPrs = openPullRequestsSweeper(manager);
+
+		await withSilencedWarnings(async () => {
+			const sweeps = Array.from({ length: 10 }, (_, index) =>
+				fetchOpenPrs(repoOf(`repo-${index}`)).catch(() => {}),
+			);
+			await tick();
+			expect(ghAttempts).toBe(GH_CALL_CONCURRENCY);
+			expect(releases).toHaveLength(GH_CALL_CONCURRENCY);
+
+			// One running lookup fails; the hold it opens drops the six waiting.
+			rejects.shift()?.(
+				Object.assign(new Error("Command failed"), { code: "ENOTFOUND" }),
+			);
+			await tick();
+			expect(manager.getGithubStatus()?.reason).toBe("unreachable");
+			expect(ghAttempts).toBe(GH_CALL_CONCURRENCY);
+
+			for (const release of releases.splice(0)) release();
+			await Promise.all(sweeps);
+		});
+
+		// The queued six never reached gh, then or after.
+		expect(ghAttempts).toBe(GH_CALL_CONCURRENCY);
+	});
+
+	test("queued probes survive two holds", async () => {
+		const db = createRealDb();
+		seedProject(db);
+		const calls: Array<{
+			resolve: (value: unknown) => void;
+			reject: (error: Error) => void;
+		}> = [];
+		const manager = createManager(db, {
+			execGh: () => {
+				const answer = Promise.withResolvers<unknown>();
+				calls.push(answer);
+				return answer.promise;
+			},
+			github: (async () => {
+				throw new Error("octokit must not run");
+			}) as never,
+		});
+		const repoOf = (name: string) => ({
+			provider: "github" as const,
+			owner: REPO.owner,
+			name,
+			url: `https://github.com/${REPO.owner}/${name}.git`,
+			remoteName: "origin",
+			defaultBranch: "main",
+		});
+		const fetchOpenPrs = openPullRequestsSweeper(manager);
+		const accessible = manager as unknown as {
+			getCachedOpenPullRequests(
+				repo: ReturnType<typeof repoOf>,
+				options?: { bypassCache?: boolean },
+			): Promise<unknown[]>;
+		};
+		const offline = () =>
+			Object.assign(new Error("Command failed"), { code: "ENOTFOUND" });
+
+		await withSilencedWarnings(async () => {
+			const sweeps = ["bg-0", "bg-1", "bg-2", "bg-3"].map((name) =>
+				fetchOpenPrs(repoOf(name)).catch(() => {}),
+			);
+			await tick();
+			expect(calls).toHaveLength(GH_CALL_CONCURRENCY);
+
+			// Three user refreshes queue behind the sweep.
+			const probes = ["p-0", "p-1", "p-2"].map((name) =>
+				accessible
+					.getCachedOpenPullRequests(repoOf(name), { bypassCache: true })
+					.catch((error: Error) => error),
+			);
+			await tick();
+			expect(calls).toHaveLength(GH_CALL_CONCURRENCY);
+
+			// First hold: the background queue is drained, the probes keep their
+			// place, and one of them takes the freed slot.
+			calls[0]?.reject(offline());
+			await tick();
+			expect(manager.getGithubStatus()?.reason).toBe("unreachable");
+			expect(calls).toHaveLength(GH_CALL_CONCURRENCY + 1);
+
+			// Its success reopens the gate and the next probe starts.
+			calls[1]?.resolve([]);
+			await tick();
+			expect(manager.getGithubStatus()).toBeNull();
+			expect(calls).toHaveLength(GH_CALL_CONCURRENCY + 2);
+
+			// A second hold must not drop the probe still waiting.
+			calls[2]?.reject(offline());
+			await tick();
+			expect(manager.getGithubStatus()?.reason).toBe("unreachable");
+
+			calls[3]?.resolve([]);
+			await tick();
+			expect(calls).toHaveLength(GH_CALL_CONCURRENCY + 3);
+
+			for (const call of calls) call.resolve([]);
+			expect(await Promise.all(probes)).toEqual([[], [], []]);
+			await Promise.all(sweeps);
+		});
 	});
 
 	test("an explicit refresh probes through an active hold", async () => {
@@ -1365,6 +1604,7 @@ describe("PullRequestRuntimeManager refresh", () => {
 			// The fetch hangs past its own post-failure window (120s after the
 			// first failure) and only then rejects.
 			const slow = sweep();
+			await tick();
 			expect(attempts).toBe(1);
 			setSystemTime(new Date(t0 + 130_000));
 			rejectInFlight?.(new Error("slow failure"));

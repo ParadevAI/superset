@@ -4,6 +4,7 @@ import {
 	describeGitHubFailure,
 	GitHubAvailabilityGate,
 	GitHubUnavailableError,
+	isGitHubTimeoutError,
 	isGitHubUnreachableError,
 } from "./github-availability";
 
@@ -22,7 +23,7 @@ describe("isGitHubUnreachableError", () => {
 		expect(isGitHubUnreachableError(wrapped)).toBe(true);
 	});
 
-	test("matches gh's stderr phrasing and an execFile timeout kill", () => {
+	test("matches gh's stderr phrasing", () => {
 		expect(
 			isGitHubUnreachableError(
 				Object.assign(new Error("Command failed: gh api"), {
@@ -31,14 +32,17 @@ describe("isGitHubUnreachableError", () => {
 				}),
 			),
 		).toBe(true);
-		expect(
-			isGitHubUnreachableError(
-				Object.assign(new Error("Command failed"), {
-					killed: true,
-					signal: "SIGTERM",
-				}),
-			),
-		).toBe(true);
+	});
+
+	test("an execFile timeout kill is our own deadline, not an outage", () => {
+		const timeout = Object.assign(new Error("Command failed"), {
+			killed: true,
+			signal: "SIGTERM",
+			code: null,
+		});
+		expect(isGitHubTimeoutError(timeout)).toBe(true);
+		expect(isGitHubUnreachableError(timeout)).toBe(false);
+		expect(classifyGitHubHold(timeout)).toBeNull();
 	});
 
 	test("matches what gh 2.98 prints for a dead resolver and a refused proxy", () => {
@@ -196,6 +200,48 @@ describe("GitHubAvailabilityGate", () => {
 			now += block;
 		}
 		expect(block).toBe(30 * 60_000);
+	});
+
+	test("repeated exec kills open the hold, one alone does not", () => {
+		const now = 0;
+		const gate = new GitHubAvailabilityGate({ now: () => now });
+		const killed = () =>
+			Object.assign(new Error("Command failed"), {
+				killed: true,
+				signal: "SIGTERM",
+				code: null,
+			});
+
+		expect(gate.recordFailure(killed())).toBeNull();
+		expect(gate.recordFailure(killed())).toBeNull();
+		expect(gate.status()).toBeNull();
+		expect(gate.recordFailure(killed())).toEqual({
+			reason: "unreachable",
+			holdMs: 60_000,
+			opened: true,
+		});
+
+		// A success in between starts the count over.
+		gate.recordSuccess();
+		expect(gate.recordFailure(killed())).toBeNull();
+	});
+
+	test("a classified answer resets the run of kills", () => {
+		let now = 0;
+		const gate = new GitHubAvailabilityGate({ now: () => now });
+		const killed = () =>
+			Object.assign(new Error("Command failed"), {
+				killed: true,
+				signal: "SIGTERM",
+				code: null,
+			});
+
+		expect(gate.recordFailure(killed())).toBeNull();
+		expect(gate.recordFailure(killed())).toBeNull();
+		// GitHub answered, even with a rate limit: the run of kills is over.
+		expect(gate.recordFailure(rateLimited())?.reason).toBe("rate-limited");
+		now += 5 * 60_000;
+		expect(gate.recordFailure(killed())).toBeNull();
 	});
 
 	test("ignores answers from GitHub and resets on success", () => {
